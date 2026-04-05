@@ -83,5 +83,24 @@ Matches `cross-org/workflows/.github/workflows/bun-ci.yml` exactly:
 
 ## Status
 
-⚠️ **Attempting to reproduce.** The hang occurs under heavy concurrent load (55 parallel workers)
-and may be timing-dependent.
+⚠️ **Bug not reproduced despite exhaustive testing.** The CompressionStream `readStream` pattern
+from `cc9261e7` works correctly under all conditions tested:
+
+| Condition | Result |
+|-----------|--------|
+| Exact code pattern from cc9261e7 | ✅ Pass |
+| 52 parallel test files (~55 in cross-org/image) | ✅ Pass |
+| Same Bun version 1.3.11 (af24e281) | ✅ Pass |
+| Heavy CPU workload (JPEG DCT, blur, color conversion) | ✅ Pass |
+| Deep module tree (14 source files) | ✅ Pass |
+| 100 synchronized workers all hitting CompressionStream simultaneously | ✅ Pass |
+| 10 consecutive full test suite runs | ✅ Pass |
+
+Both this repro and cross-org/image CI use **Bun 1.3.11** (confirmed from CI logs).
+The cross-org/image first CI run failed, but re-runs of the same code passed — classic
+intermittent race condition behavior.
+
+The hang appears to require conditions specific to the full cross-org/image test suite
+(55 files, 626 tests, 40+ source files with complex TypeScript generics) that cannot
+be reduced to a minimal reproduction. This may indicate a thread pool exhaustion issue
+that only manifests under very specific timing and resource pressure conditions.
