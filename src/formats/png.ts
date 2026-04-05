@@ -1,0 +1,53 @@
+/**
+ * Minimal PNGFormat replicating cross-org/image's PNGFormat class structure.
+ * https://github.com/cross-org/image/blob/cc9261e7c1412265872a6020135002bc8cd5c92d/src/formats/png.ts
+ *
+ * PNGFormat extends PNGBase. encode() calls this.deflate() (from PNGBase).
+ * decode() calls this.inflate() (from PNGBase).
+ * These are the exact methods that hang in Bun CI.
+ */
+
+import { PNGBase } from "./png_base.ts";
+
+export interface ImageData {
+  width: number;
+  height: number;
+  data: Uint8Array;
+}
+
+export class PNGFormat extends PNGBase {
+  readonly name = "png";
+  readonly mimeType = "image/png";
+
+  /**
+   * Encode RGBA image data to a minimal PNG-like format.
+   * Mirrors the cross-org/image PNGFormat.encode() call chain:
+   * filterData() → this.deflate() (PNGBase.deflate → readStream → CompressionStream)
+   */
+  async encode(imageData: ImageData): Promise<Uint8Array> {
+    const { width, height, data } = imageData;
+    const filtered = this.filterData(data, width, height);
+    const compressed = await this.deflate(filtered);
+
+    // Minimal PNG-like container: 4-byte width + 4-byte height + compressed data
+    const result = new Uint8Array(8 + compressed.length);
+    new DataView(result.buffer).setUint32(0, width, false);
+    new DataView(result.buffer).setUint32(4, height, false);
+    result.set(compressed, 8);
+    return result;
+  }
+
+  /**
+   * Decode a PNG-like blob back to RGBA.
+   * Mirrors the cross-org/image PNGFormat.decode() call chain:
+   * this.inflate() (PNGBase.inflate → readStream → DecompressionStream)
+   */
+  async decode(data: Uint8Array): Promise<ImageData> {
+    const width = new DataView(data.buffer).getUint32(0, false);
+    const height = new DataView(data.buffer).getUint32(4, false);
+    const compressed = data.subarray(8);
+    const filtered = await this.inflate(compressed);
+    const rgba = this.unfilterData(filtered, width, height);
+    return { width, height, data: rgba };
+  }
+}

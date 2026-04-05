@@ -1,54 +1,58 @@
 # Bun CompressionStream hang reproduction
 
-Minimal reproduction of tests hanging in `bun test` on GitHub Actions CI.
-Mirrors the patterns from [cross-org/image PR #100](https://github.com/cross-org/image/pull/100).
+Reproduces the `CompressionStream` / `DecompressionStream` hang seen in
+[cross-org/image PR #100](https://github.com/cross-org/image/pull/100) CI
+(Bun v1.3.11, job [70009490278](https://github.com/cross-org/image/actions/runs/...)).
 
-## Root cause (discovered)
+## Root cause
 
-The hang in cross-org/image is caused by a **lazy `await import("node:zlib")` race condition**
-across parallel Bun test workers — NOT a `CompressionStream` bug.
+The hang requires **two conditions** to occur simultaneously:
 
-`utils/deflate.ts` (introduced in PR #100) defers the `node:zlib` import to the first call:
+1. **The `readStream` + `CompressionStream` pattern**: reading a piped
+   `CompressionStream` output via a manual `reader.read()` loop from a
+   `ReadableStream` created inline.
 
-```typescript
-let _zlib: NodeZlib | null | undefined;
+2. **Concurrent shared-module imports**: multiple Bun test workers (processes)
+   ALL importing from the SAME TypeScript source files
+   (`png_base.ts` → `tiff_deflate.ts`) at startup. This synchronizes workers
+   so they all call `readStream()` → `new CompressionStream("deflate")` at
+   roughly the same instant. Under this concurrent load, Bun v1.3.11's
+   `TransformStream`/`ReadableStream` implementation deadlocks.
 
-async function getZlib(): Promise<NodeZlib | null> {
-  if (_zlib !== undefined) return _zlib;
-  try {
-    const m = await import("node:zlib"); // ← hangs when called concurrently
-    _zlib = m as unknown as NodeZlib;
-  } catch { _zlib = null; }
-  return _zlib;
-}
+**Why the previous repro attempts all passed**: they had inline code in each
+test file — no shared TypeScript source imports. Without the module-loading
+synchronization point, workers started at different times and never competed
+for the CompressionStream simultaneously.
+
+## Evidence from cross-org/image CI
+
+The failing CI (merge commit `cc9261e7`, job `70009490278`) already had
+the `readStream` fix applied. PNG tests **passed** because the png.test.ts
+worker ran with lighter module loading. ICO/TIFF/APNG tests **failed** because:
+
+- `ico.test.ts` → imports `ico.ts` → `png.ts` → `png_base.ts`
+- `tiff.test.ts` → imports `tiff_deflate.ts` → `png_base.ts`
+- Multiple other workers also import `png_base.ts`
+
+When 20+ workers all load `png_base.ts` in parallel and immediately call
+`deflate()` / `inflate()`, the `CompressionStream` hangs.
+
+## Repository structure
+
 ```
+src/
+  formats/
+    png_base.ts         ← exact copy of cross-org/image PNGBase (cc9261e7)
+    png.ts              ← PNGFormat extends PNGBase
+    ico.ts              ← ICOFormat delegates to PNGFormat
+  utils/
+    tiff_deflate.ts     ← exact copy of cross-org/image tiff_deflate.ts (cc9261e7)
 
-With 55 parallel Bun v1.3.11 test workers all hitting `deflateData()` in their first test
-simultaneously, the concurrent `await import("node:zlib")` deadlocks intermittently.
-
-The hang is intermittent (first CI attempt failed, second passed with identical code).
-
-## Call chain
-
+delegation.test.ts      ← imports ICOFormat from src/formats/ico.ts
+tiff_deflate.test.ts    ← imports deflateCompress from src/utils/tiff_deflate.ts
+deflate_worker_01-20.test.ts  ← 20 files, each importing tiff_deflate.ts
+compression.test.ts     ← bun:test baseline (inline, always passes)
 ```
-ICOFormat.encode() → PNGFormat.encode() → PNGBase.deflate()
-  → deflateData()  → getZlib()  → await import("node:zlib")  ← hangs
-```
-
-The double-`Response` wrapping pattern (`new Response(data).body → CompressionStream →
-new Response(stream).arrayBuffer()`) from **before** PR #100 also hangs in Bun, but
-always (not intermittently). PR #100 replaced it with `deflateData`/`inflateData`, which
-introduced the intermittent lazy-import race condition instead.
-
-## Test files in this repo
-
-- **`compression.test.ts`** — `bun:test` directly; includes the double-`Response` pattern  
-- **`delegation.test.ts`** — `ICO → PNG → deflateData()` delegation chain, `@cross/test`
-- **`tiff_deflate.test.ts`** — TIFF Deflate pattern via `deflateData/inflateData`, `@cross/test`
-- **`deflate_worker_01.test.ts` – `deflate_worker_20.test.ts`** — 20 files, each an exact copy
-  of `utils/deflate.ts`'s `getZlib()` + `deflateData/inflateData` pattern with `@cross/test`.
-  Together with the other 3 files, this is 23 parallel workers all doing
-  `await import("node:zlib")` simultaneously — matching cross-org/image's 55-worker scale.
 
 ## Reproduce locally
 
@@ -57,15 +61,18 @@ bun x jsr add @cross/test @std/assert
 bun test
 ```
 
+Tests importing from `src/` should time out after 5 000 ms.
+
 ## Reproduce in CI
 
 Push to GitHub. The workflow at `.github/workflows/test.yml` runs `bun test` on push/PR.
 
 ## Expected behaviour (if fixed)
 
-All tests pass quickly.
+All tests pass quickly (< 100 ms each).
 
 ## Actual behaviour
 
-Intermittently, workers that simultaneously execute `await import("node:zlib")` for the
-first time hang indefinitely, causing the 5 000 ms default timeout to fire.
+Tests in files that import from `src/formats/png_base.ts` or
+`src/utils/tiff_deflate.ts` hang at `reader.read()` inside `readStream()`,
+timing out after 5 000 ms.

@@ -1,118 +1,38 @@
 /**
- * Worker file 09/20 — replicates the EXACT deflateData/inflateData pattern
- * from cross-org/image utils/deflate.ts at commit 0201dc61:
- * https://raw.githubusercontent.com/cross-org/image/0201dc61f7f5646c22c8f3f6e9bd32f3e1bf78b3/src/utils/deflate.ts
+ * Worker file 09/20 — replicates the structure of cross-org/image test files
+ * that import from shared TypeScript source files.
  *
- * Key: deflateData() does a LAZY await import("node:zlib") on first call.
- * With 20 parallel Bun test workers all hitting this simultaneously, the
- * concurrent dynamic import can trigger the intermittent Bun deadlock seen
- * in cross-org/image CI (first attempt failed, second passed).
- *
- * Uses @cross/test to match cross-org/image's test framework exactly.
+ * KEY: This file imports from src/utils/tiff_deflate.ts, which imports from
+ * src/formats/png_base.ts. When 20+ Bun test workers simultaneously import
+ * and execute these shared TypeScript modules with CompressionStream, the
+ * concurrent module loading synchronizes them — triggering the Bun hang seen
+ * in cross-org/image CI (commit cc9261e7, job 70009490278).
  */
 
 import { test } from "@cross/test";
 import { assertEquals } from "@std/assert";
+import { deflateCompress, deflateDecompress } from "./src/utils/tiff_deflate.ts";
 
-// ── Exact copy of utils/deflate.ts from cross-org/image @ 0201dc61 ──
+const PAYLOAD = new Uint8Array(2304);
+for (let j = 0; j < PAYLOAD.length; j++) PAYLOAD[j] = (j * 9) & 0xff;
 
-type NodeZlib = {
-  deflateSync(buf: Uint8Array): Uint8Array;
-  inflateSync(buf: Uint8Array): Uint8Array;
-};
-
-let _zlib: NodeZlib | null | undefined;
-
-async function getZlib(): Promise<NodeZlib | null> {
-  if (_zlib !== undefined) return _zlib;
-  try {
-    const m = await import("node:zlib");
-    _zlib = m as unknown as NodeZlib;
-  } catch {
-    _zlib = null;
-  }
-  return _zlib;
-}
-
-async function readStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = [];
-  const reader = stream.getReader();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-    }
-  } finally { reader.releaseLock(); }
-  const total = chunks.reduce((n, c) => n + c.byteLength, 0);
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
-  return out;
-}
-
-async function deflateData(data: Uint8Array): Promise<Uint8Array> {
-  const zlib = await getZlib();
-  if (zlib) {
-    const r = zlib.deflateSync(data);
-    return r instanceof Uint8Array ? r : new Uint8Array(r);
-  }
-  return readStream(
-    new ReadableStream<Uint8Array>({ start(c) { c.enqueue(data); c.close(); } })
-      .pipeThrough(new CompressionStream("deflate")),
-  );
-}
-
-async function inflateData(data: Uint8Array): Promise<Uint8Array> {
-  const zlib = await getZlib();
-  if (zlib) {
-    const r = zlib.inflateSync(data);
-    return r instanceof Uint8Array ? r : new Uint8Array(r);
-  }
-  return readStream(
-    new ReadableStream<Uint8Array>({ start(c) { c.enqueue(data); c.close(); } })
-      .pipeThrough(new DecompressionStream("deflate")),
-  );
-}
-
-// ── Tests: each triggers the lazy getZlib() → await import("node:zlib") ──
-
-const PAYLOAD = (() => {
-  const buf = new Uint8Array(65536);
-  for (let j = 0; j < buf.length; j++) buf[j] = j & 0xff;
-  return buf;
-})();
-
-test("worker-09: deflateData + inflateData roundtrip (first call triggers dynamic import)", async () => {
-  const compressed = await deflateData(PAYLOAD);
-  const decompressed = await inflateData(compressed);
+test("worker-09: deflate + inflate roundtrip", async () => {
+  const compressed = await deflateCompress(PAYLOAD);
+  const decompressed = await deflateDecompress(compressed);
   assertEquals(decompressed.length, PAYLOAD.length);
   assertEquals(decompressed[0], PAYLOAD[0]);
 });
 
-test("worker-09: deflateData small payload", async () => {
-  const data = new Uint8Array([1, 2, 3, 4, 5]);
-  const c = await deflateData(data);
-  const r = await inflateData(c);
-  assertEquals(r, data);
+test("worker-09: deflate compress small payload", async () => {
+  const data = new Uint8Array([9, 18, 27, 255]);
+  const compressed = await deflateCompress(data);
+  const decompressed = await deflateDecompress(compressed);
+  assertEquals(decompressed, data);
 });
 
-test("worker-09: inflateData only (zlib pre-cached after first test)", async () => {
-  const data = new Uint8Array(128).fill(42);
-  const c = await deflateData(data);
-  const r = await inflateData(c);
-  assertEquals(r, data);
-});
-
-test("worker-09: sequential deflate calls", async () => {
-  const a = await deflateData(PAYLOAD.subarray(0, 16384));
-  const b = await deflateData(PAYLOAD.subarray(16384, 32768));
-  assertEquals((await inflateData(a)).length, 16384);
-  assertEquals((await inflateData(b)).length, 16384);
-});
-
-test("worker-09: deflateData large payload", async () => {
-  const c = await deflateData(PAYLOAD);
-  const r = await inflateData(c);
-  assertEquals(r[r.length - 1], PAYLOAD[PAYLOAD.length - 1]);
+test("worker-09: deflate roundtrip partial payload", async () => {
+  const slice = PAYLOAD.subarray(0, Math.max(1, PAYLOAD.length >> 1));
+  const compressed = await deflateCompress(slice);
+  const decompressed = await deflateDecompress(compressed);
+  assertEquals(decompressed.length, slice.length);
 });
