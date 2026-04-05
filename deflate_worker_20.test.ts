@@ -1,16 +1,16 @@
 /**
- * Worker file 20/20 — generates parallel CompressionStream load to reproduce
- * the intermittent deadlock seen in cross-org/image (Bun v1.3.11, 55 test files).
+ * Worker file 20/20 — heavy CompressionStream load to reproduce the
+ * intermittent deadlock from cross-org/image (Bun v1.3.11, 55 parallel workers).
  *
- * Uses the exact readStream helper and CompressionStream pattern from cross-org/image
- * after PR #100 (commit 0201dc61), combined with @cross/test's async shim loader.
+ * Each test processes a ~512 KB payload so the operation takes ~50-200ms.
+ * With 20 files running in parallel Bun workers, this creates sustained
+ * concurrent CompressionStream pressure similar to cross-org/image's test suite.
  */
 
 import { test } from "@cross/test";
 import { assertEquals } from "@std/assert";
-import { deflateSync, inflateSync } from "node:zlib";
 
-/** Exact readStream helper from cross-org/image src/formats/png_base.ts */
+/** Exact readStream helper from cross-org/image (post-PR #100 fix). */
 async function readStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   const reader = stream.getReader();
@@ -30,56 +30,69 @@ async function readStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Arra
   return out;
 }
 
-/** Exact deflate helper from cross-org/image after PR #100 */
 function deflate(data: Uint8Array): Promise<Uint8Array> {
   return readStream(
-    new ReadableStream<Uint8Array>({
-      start(c) { c.enqueue(data); c.close(); },
-    }).pipeThrough(new CompressionStream("deflate")),
+    new ReadableStream<Uint8Array>({ start(c) { c.enqueue(data); c.close(); } })
+      .pipeThrough(new CompressionStream("deflate")),
   );
 }
 
-/** Exact inflate helper from cross-org/image after PR #100 */
 function inflate(data: Uint8Array): Promise<Uint8Array> {
   return readStream(
-    new ReadableStream<Uint8Array>({
-      start(c) { c.enqueue(data); c.close(); },
-    }).pipeThrough(new DecompressionStream("deflate")),
+    new ReadableStream<Uint8Array>({ start(c) { c.enqueue(data); c.close(); } })
+      .pipeThrough(new DecompressionStream("deflate")),
   );
 }
 
-const PAYLOAD_20 = (() => {
-  const buf = new Uint8Array(4096);
-  for (let i = 0; i < buf.length; i++) buf[i] = (i * 20) & 0xff;
+/** ~512 KB payload unique to this worker. */
+const PAYLOAD = (() => {
+  const buf = new Uint8Array(524288);
+  for (let j = 0; j < buf.length; j++) buf[j] = (j * 20 + j) & 0xff;
   return buf;
 })();
 
-test("worker-20: deflate roundtrip (small)", async () => {
-  const compressed = await deflate(PAYLOAD_20.subarray(0, 64));
-  const result = await inflate(compressed);
-  assertEquals(result, PAYLOAD_20.subarray(0, 64));
+test("worker-20: deflate + inflate roundtrip A", async () => {
+  const c = await deflate(PAYLOAD);
+  const r = await inflate(c);
+  assertEquals(r.length, PAYLOAD.length);
+  assertEquals(r[0], PAYLOAD[0]);
+  assertEquals(r[PAYLOAD.length - 1], PAYLOAD[PAYLOAD.length - 1]);
 });
 
-test("worker-20: deflate roundtrip (medium)", async () => {
-  const compressed = await deflate(PAYLOAD_20.subarray(0, 512));
-  const result = await inflate(compressed);
-  assertEquals(result, PAYLOAD_20.subarray(0, 512));
+test("worker-20: deflate + inflate roundtrip B", async () => {
+  const slice = PAYLOAD.subarray(0, 262144);
+  const c = await deflate(slice);
+  const r = await inflate(c);
+  assertEquals(r.length, slice.length);
+  assertEquals(r[0], slice[0]);
 });
 
-test("worker-20: deflate roundtrip (full)", async () => {
-  const compressed = await deflate(PAYLOAD_20);
-  const result = await inflate(compressed);
-  assertEquals(result, PAYLOAD_20);
+test("worker-20: deflate + inflate roundtrip C", async () => {
+  const slice = PAYLOAD.subarray(262144);
+  const c = await deflate(slice);
+  const r = await inflate(c);
+  assertEquals(r.length, slice.length);
 });
 
-test("worker-20: deflate → node:zlib decompress", async () => {
-  const compressed = await deflate(PAYLOAD_20.subarray(0, 256));
-  const result = inflateSync(compressed);
-  assertEquals(new Uint8Array(result), PAYLOAD_20.subarray(0, 256));
+test("worker-20: three sequential deflate calls", async () => {
+  const a = await deflate(PAYLOAD.subarray(0, 131072));
+  const b = await deflate(PAYLOAD.subarray(131072, 262144));
+  const c2 = await deflate(PAYLOAD.subarray(262144, 393216));
+  assertEquals((await inflate(a)).length, 131072);
+  assertEquals((await inflate(b)).length, 131072);
+  assertEquals((await inflate(c2)).length, 131072);
 });
 
-test("worker-20: node:zlib compress → inflate", async () => {
-  const compressed = deflateSync(PAYLOAD_20.subarray(0, 256));
-  const result = await inflate(new Uint8Array(compressed));
-  assertEquals(result, PAYLOAD_20.subarray(0, 256));
+test("worker-20: concurrent deflate via Promise.all", async () => {
+  const slices = [
+    PAYLOAD.subarray(0, 131072),
+    PAYLOAD.subarray(131072, 262144),
+    PAYLOAD.subarray(262144, 393216),
+    PAYLOAD.subarray(393216),
+  ];
+  const compressed = await Promise.all(slices.map(deflate));
+  const results = await Promise.all(compressed.map(inflate));
+  for (let k = 0; k < slices.length; k++) {
+    assertEquals(results[k].length, slices[k].length);
+  }
 });
