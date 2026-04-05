@@ -34,7 +34,8 @@ async function readStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Arra
 }
 
 /**
- * Exact replica of tiff_deflate.ts deflateCompress() after commit 4ca2578 in cross-org/image.
+ * Exact replica of tiff_deflate.ts deflateCompress() after commit 4ca2578 in cross-org/image:
+ * https://github.com/cross-org/image/blob/4ca2578d26e88783e12667abb68c15811ba0f88f/src/utils/tiff_deflate.ts
  */
 function deflateCompress(data: Uint8Array): Promise<Uint8Array> {
   return readStream(
@@ -48,7 +49,8 @@ function deflateCompress(data: Uint8Array): Promise<Uint8Array> {
 }
 
 /**
- * Exact replica of tiff_deflate.ts deflateDecompress() after commit 4ca2578.
+ * Exact replica of tiff_deflate.ts deflateDecompress() after commit 4ca2578:
+ * https://github.com/cross-org/image/blob/4ca2578d26e88783e12667abb68c15811ba0f88f/src/utils/tiff_deflate.ts
  */
 function deflateDecompress(data: Uint8Array): Promise<Uint8Array> {
   return readStream(

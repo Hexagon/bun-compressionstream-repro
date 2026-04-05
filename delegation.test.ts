@@ -40,7 +40,8 @@ async function readStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Arra
 
 /**
  * Mimics PNGBase (the base class for PNG/APNG in cross-org/image).
- * deflate() is the exact pattern used in png_base.ts after commit 4ca2578.
+ * deflate() is the exact pattern used in png_base.ts after commit 4ca2578:
+ * https://github.com/cross-org/image/blob/4ca2578d26e88783e12667abb68c15811ba0f88f/src/formats/png_base.ts
  */
 class PNGLikeEncoder {
   async deflate(data: Uint8Array): Promise<Uint8Array> {
@@ -89,6 +90,8 @@ class ICOLikeEncoder {
 
 /**
  * Mimics APNGFormat (which extends PNGBase and calls this.deflate() directly).
+ * Replicates the pattern from src/formats/apng.ts in cross-org/image:
+ * https://github.com/cross-org/image/blob/4ca2578d26e88783e12667abb68c15811ba0f88f/src/formats/apng.ts
  */
 class APNGLikeEncoder {
   private base = new PNGLikeEncoder();
