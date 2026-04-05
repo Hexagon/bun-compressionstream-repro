@@ -1,31 +1,64 @@
 /**
- * Replicates cross-org/image tiff_deflate.ts — ORIGINAL "double Response"
- * pattern from main (b16127ef) that hangs in certain Bun versions.
+ * Exact copy of tiff_deflate.ts from cross-org/image at cc9261e7.
+ * Uses the readStream + ReadableStream pattern — the actual code that hangs.
  *
- * Base:  https://github.com/cross-org/image/blob/b16127ef/src/utils/tiff_deflate.ts
- * Fix:   https://github.com/cross-org/image/blob/cc9261e7/src/utils/tiff_deflate.ts
+ * Source: https://github.com/cross-org/image/blob/cc9261e7/src/utils/tiff_deflate.ts
  */
 
 /**
- * Compress data using Deflate — ORIGINAL pattern from b16127ef.
+ * Collect all chunks from a ReadableStream<Uint8Array> into a single Uint8Array.
+ * Using ReadableStream directly (instead of new Response(data).body) avoids a hang
+ * in certain Bun versions when feeding Uint8Array data into CompressionStream/
+ * DecompressionStream via the Response body wrapper.
  */
-export async function deflateCompress(
-  data: Uint8Array,
-): Promise<Uint8Array> {
-  const stream = new Response(data as unknown as BodyInit).body!
-    .pipeThrough(new CompressionStream("deflate"));
-  const compressed = await new Response(stream).arrayBuffer();
-  return new Uint8Array(compressed);
+async function readStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return result;
 }
 
 /**
- * Decompress Deflate data — ORIGINAL pattern from b16127ef.
+ * Compress data using Deflate — exact pattern from cc9261e7.
  */
-export async function deflateDecompress(
+export function deflateCompress(data: Uint8Array): Promise<Uint8Array> {
+  return readStream(
+    new ReadableStream({
+      start(controller) {
+        controller.enqueue(data);
+        controller.close();
+      },
+    }).pipeThrough(new CompressionStream("deflate")),
+  );
+}
+
+/**
+ * Decompress Deflate data — exact pattern from cc9261e7.
+ */
+export function deflateDecompress(
   data: Uint8Array,
 ): Promise<Uint8Array> {
-  const stream = new Response(data as unknown as BodyInit).body!
-    .pipeThrough(new DecompressionStream("deflate"));
-  const decompressed = await new Response(stream).arrayBuffer();
-  return new Uint8Array(decompressed);
+  return readStream(
+    new ReadableStream({
+      start(controller) {
+        controller.enqueue(data);
+        controller.close();
+      },
+    }).pipeThrough(new DecompressionStream("deflate")),
+  );
 }

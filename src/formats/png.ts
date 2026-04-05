@@ -1,10 +1,10 @@
 /**
  * Minimal PNGFormat replicating cross-org/image's PNGFormat class structure.
- * https://github.com/cross-org/image/blob/cc9261e7c1412265872a6020135002bc8cd5c92d/src/formats/png.ts
+ * https://github.com/cross-org/image/blob/cc9261e7/src/formats/png.ts
  *
  * PNGFormat extends PNGBase. encode() calls this.deflate() (from PNGBase).
  * decode() calls this.inflate() (from PNGBase).
- * These are the exact methods that hang in Bun CI.
+ * These use the readStream + CompressionStream pattern that hangs in Bun CI.
  */
 
 import { PNGBase } from "./png_base.ts";
