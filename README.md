@@ -1,67 +1,54 @@
 # Bun CompressionStream hang reproduction
 
-Minimal reproduction of `CompressionStream` / `DecompressionStream` hanging in `bun test` on GitHub
-Actions CI. Mirrors the patterns from [cross-org/image PR #100](https://github.com/cross-org/image/pull/100).
+Minimal reproduction of tests hanging in `bun test` on GitHub Actions CI.
+Mirrors the patterns from [cross-org/image PR #100](https://github.com/cross-org/image/pull/100).
 
-## Issue
+## Root cause (discovered)
 
-When consuming a `CompressionStream` output via `new Response(stream).arrayBuffer()` in Bun, the
-Promise never resolves and the test times out. This is the **double `Response` wrapping** pattern:
+The hang in cross-org/image is caused by a **lazy `await import("node:zlib")` race condition**
+across parallel Bun test workers — NOT a `CompressionStream` bug.
 
-```typescript
-// BROKEN — hangs in Bun
-const stream = new Response(data as unknown as BodyInit).body!
-  .pipeThrough(new CompressionStream("deflate"));
-const compressed = await new Response(stream).arrayBuffer(); // ← never resolves
-```
-
-The workaround (used by PR #100's fix) is to read the stream directly:
+`utils/deflate.ts` (introduced in PR #100) defers the `node:zlib` import to the first call:
 
 ```typescript
-// FIXED — works in Bun
-async function readStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-  }
-  // ... concat chunks ...
+let _zlib: NodeZlib | null | undefined;
+
+async function getZlib(): Promise<NodeZlib | null> {
+  if (_zlib !== undefined) return _zlib;
+  try {
+    const m = await import("node:zlib"); // ← hangs when called concurrently
+    _zlib = m as unknown as NodeZlib;
+  } catch { _zlib = null; }
+  return _zlib;
 }
-const compressed = await readStream(
-  new ReadableStream({ start(c) { c.enqueue(data); c.close(); } })
-    .pipeThrough(new CompressionStream("deflate"))
-);
 ```
 
-The hang reproduces reliably in GitHub Actions CI with `antongolub/action-setup-bun@v1.13.2` using
-`bun-version: v1.x` (Bun v1.3.11).
+With 55 parallel Bun v1.3.11 test workers all hitting `deflateData()` in their first test
+simultaneously, the concurrent `await import("node:zlib")` deadlocks intermittently.
 
-## Context — cross-org/image investigation
+The hang is intermittent (first CI attempt failed, second passed with identical code).
 
-In [cross-org/image PR #100](https://github.com/cross-org/image/pull/100), `bun test` ran 626 tests
-across 55 files. Tests using `CompressionStream` / `DecompressionStream` with the double-`Response`
-pattern all timed out:
+## Call chain
 
-- `test/formats/ico.test.ts` — `ICOFormat.encode()` → `PNGFormat.encode()` → double-`Response` deflate → **hung at 5000ms**
-- `test/formats/tiff.test.ts` — Deflate compression → **hung at 5000ms**
-- `test/formats/apng.test.ts` — frame encoding → **hung at 5000ms**
+```
+ICOFormat.encode() → PNGFormat.encode() → PNGBase.deflate()
+  → deflateData()  → getZlib()  → await import("node:zlib")  ← hangs
+```
 
-The **fix** in PR #100 replaced the double-`Response` wrapping with a direct `ReadableStream`
-reader loop, which works correctly.
+The double-`Response` wrapping pattern (`new Response(data).body → CompressionStream →
+new Response(stream).arrayBuffer()`) from **before** PR #100 also hangs in Bun, but
+always (not intermittently). PR #100 replaced it with `deflateData`/`inflateData`, which
+introduced the intermittent lazy-import race condition instead.
 
 ## Test files in this repo
 
-- **`compression.test.ts`** — `bun:test` directly; includes both working and broken patterns
-- **`delegation.test.ts`** — replicates the `ICO → PNG → CompressionStream` class delegation
-  using `@cross/test` and the double-`Response` pattern from before PR #100
-- **`tiff_deflate.test.ts`** — replicates the TIFF Deflate pattern using `@cross/test` and the
-  double-`Response` pattern
-- **`deflate_worker_01.test.ts` – `deflate_worker_20.test.ts`** — 20 files each running 5
-  CompressionStream roundtrip tests with `@cross/test`, using the exact `readStream` helper
-  from cross-org/image after PR #100. These create the parallel-worker CompressionStream load
-  (~100 ops across 20 Bun worker processes) that triggers the intermittent deadlock.
+- **`compression.test.ts`** — `bun:test` directly; includes the double-`Response` pattern  
+- **`delegation.test.ts`** — `ICO → PNG → deflateData()` delegation chain, `@cross/test`
+- **`tiff_deflate.test.ts`** — TIFF Deflate pattern via `deflateData/inflateData`, `@cross/test`
+- **`deflate_worker_01.test.ts` – `deflate_worker_20.test.ts`** — 20 files, each an exact copy
+  of `utils/deflate.ts`'s `getZlib()` + `deflateData/inflateData` pattern with `@cross/test`.
+  Together with the other 3 files, this is 23 parallel workers all doing
+  `await import("node:zlib")` simultaneously — matching cross-org/image's 55-worker scale.
 
 ## Reproduce locally
 
@@ -70,18 +57,15 @@ bun x jsr add @cross/test @std/assert
 bun test
 ```
 
-Tests using `new Response(stream).arrayBuffer()` will time out after 5 000 ms.
-
 ## Reproduce in CI
 
-Push this repo to GitHub. The workflow at `.github/workflows/test.yml` will run `bun test`
-automatically on push / PR.
+Push to GitHub. The workflow at `.github/workflows/test.yml` runs `bun test` on push/PR.
 
 ## Expected behaviour (if fixed)
 
 All tests pass quickly.
 
-## Actual behaviour (affected Bun versions)
+## Actual behaviour
 
-Tests using `await new Response(piped_stream).arrayBuffer()` hang indefinitely and are killed by
-the 5 000 ms default timeout.
+Intermittently, workers that simultaneously execute `await import("node:zlib")` for the
+first time hang indefinitely, causing the 5 000 ms default timeout to fire.

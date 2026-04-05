@@ -1,103 +1,117 @@
 /**
- * Mimics the cross-org/image TIFF Deflate compression tests that hung in Bun CI.
+ * Replicates the cross-org/image TIFF Deflate compression tests
+ * that hung in Bun CI (PR #100 first attempt, commit 0201dc61).
  *
- * Uses the ORIGINAL BROKEN pattern from png_base.ts before PR #100's fix:
- * https://github.com/cross-org/image/pull/100/files
+ * Root cause: deflateData/inflateData in utils/deflate.ts do a LAZY
+ * `await import("node:zlib")` on their first call. When 55 parallel Bun
+ * test workers all hit this simultaneously, the concurrent dynamic import
+ * deadlocks intermittently in Bun v1.3.11.
  *
- * The broken code: new Response(data).body → CompressionStream → new Response(stream).arrayBuffer()
- * This double-Response wrapping hangs in Bun when run under @cross/test.
- *
- * This file uses @cross/test to replicate the exact framework used in cross-org/image.
+ * Uses @cross/test to match cross-org/image's test framework exactly.
  */
 
 import { test } from "@cross/test";
 import { assertEquals } from "@std/assert";
-import { inflateSync, deflateSync } from "node:zlib";
 
-/**
- * Original broken deflateCompress pattern from png_base.ts before the fix:
- * https://github.com/cross-org/image/blob/0201dc61f7f5646c22c8f3f6e9bd32f3e1bf78b3/src/formats/png_base.ts
- *
- * Feeds a Uint8Array as BodyInit through new Response().body,
- * then consumes the piped output via new Response(stream).arrayBuffer().
- */
-async function deflateCompress(data: Uint8Array): Promise<Uint8Array> {
-  const stream = new Response(data as unknown as BodyInit).body!
-    .pipeThrough(new CompressionStream("deflate"));
-  const compressed = await new Response(stream).arrayBuffer();
-  return new Uint8Array(compressed);
+// ── Exact copy of utils/deflate.ts from cross-org/image @ 0201dc61 ──
+// https://raw.githubusercontent.com/cross-org/image/0201dc61f7f5646c22c8f3f6e9bd32f3e1bf78b3/src/utils/deflate.ts
+
+type NodeZlib = {
+  deflateSync(buf: Uint8Array): Uint8Array;
+  inflateSync(buf: Uint8Array): Uint8Array;
+};
+
+let _zlib: NodeZlib | null | undefined;
+
+async function getZlib(): Promise<NodeZlib | null> {
+  if (_zlib !== undefined) return _zlib;
+  try {
+    const m = await import("node:zlib");
+    _zlib = m as unknown as NodeZlib;
+  } catch {
+    _zlib = null;
+  }
+  return _zlib;
 }
 
-/**
- * Original broken deflateDecompress pattern from png_base.ts before the fix:
- * https://github.com/cross-org/image/blob/0201dc61f7f5646c22c8f3f6e9bd32f3e1bf78b3/src/formats/png_base.ts
- */
-async function deflateDecompress(data: Uint8Array): Promise<Uint8Array> {
-  const stream = new Response(data as unknown as BodyInit).body!
-    .pipeThrough(new DecompressionStream("deflate"));
-  const decompressed = await new Response(stream).arrayBuffer();
-  return new Uint8Array(decompressed);
+async function readStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+  } finally { reader.releaseLock(); }
+  const total = chunks.reduce((n, c) => n + c.byteLength, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out;
 }
 
-// ── Reproduce cross-org/image: TIFF Deflate compression tests ──
+/** deflateData from utils/deflate.ts: lazy node:zlib with CompressionStream fallback */
+async function deflateData(data: Uint8Array): Promise<Uint8Array> {
+  const zlib = await getZlib();
+  if (zlib) {
+    const r = zlib.deflateSync(data);
+    return r instanceof Uint8Array ? r : new Uint8Array(r);
+  }
+  return readStream(
+    new ReadableStream<Uint8Array>({ start(c) { c.enqueue(data); c.close(); } })
+      .pipeThrough(new CompressionStream("deflate")),
+  );
+}
+
+/** inflateData from utils/deflate.ts: lazy node:zlib with DecompressionStream fallback */
+async function inflateData(data: Uint8Array): Promise<Uint8Array> {
+  const zlib = await getZlib();
+  if (zlib) {
+    const r = zlib.inflateSync(data);
+    return r instanceof Uint8Array ? r : new Uint8Array(r);
+  }
+  return readStream(
+    new ReadableStream<Uint8Array>({ start(c) { c.enqueue(data); c.close(); } })
+      .pipeThrough(new DecompressionStream("deflate")),
+  );
+}
+
+// ── Tests: first deflate call triggers lazy getZlib() → await import("node:zlib") ──
 
 test("TIFF-like: encode and decode with Deflate compression", async () => {
-  const imageData = new Uint8Array([
-    255, 0, 0, 255, 0, 255, 0, 255,
-    0, 0, 255, 255, 255, 255, 0, 255,
-  ]);
-  const compressed = await deflateCompress(imageData);
-  const decompressed = await deflateDecompress(compressed);
+  const imageData = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255]);
+  const compressed = await deflateData(imageData);
+  const decompressed = await inflateData(compressed);
   assertEquals(decompressed, imageData);
 });
 
 test("TIFF-like: Deflate compression roundtrip", async () => {
-  const width = 10;
-  const height = 10;
-  const data = new Uint8Array(width * height * 4);
-  for (let i = 0; i < data.length; i++) {
-    data[i] = Math.floor((i / data.length) * 255);
-  }
-  const compressed = await deflateCompress(data);
-  const decompressed = await deflateDecompress(compressed);
+  const data = new Uint8Array(400);
+  for (let i = 0; i < data.length; i++) data[i] = Math.floor((i / data.length) * 255);
+  const compressed = await deflateData(data);
+  const decompressed = await inflateData(compressed);
   assertEquals(decompressed, data);
 });
 
 test("TIFF-like: encode CMYK with Deflate compression", async () => {
-  // Mimics TIFF CMYK encode + deflate
   const cmykData = new Uint8Array([0, 255, 0, 0, 255, 0, 255, 0, 0, 0, 0, 255]);
-  const compressed = await deflateCompress(cmykData);
-  const decompressed = await deflateDecompress(compressed);
+  const compressed = await deflateData(cmykData);
+  const decompressed = await inflateData(compressed);
   assertEquals(decompressed, cmykData);
 });
 
-test("TIFF-like: Deflate with DecompressionStream only", async () => {
-  // Compress with node:zlib, decompress with DecompressionStream
-  const data = new Uint8Array(40).fill(42);
-  const nodeCompressed = deflateSync(data);
-  const decompressed = await deflateDecompress(new Uint8Array(nodeCompressed));
+test("TIFF-like: deflate and inflate small data", async () => {
+  const data = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+  const compressed = await deflateData(data);
+  const decompressed = await inflateData(compressed);
   assertEquals(decompressed, data);
 });
 
-test("TIFF-like: CompressionStream only (no roundtrip)", async () => {
-  const data = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
-  const compressed = await deflateCompress(data);
-  // Verify via node:zlib
-  const decompressed = inflateSync(compressed);
-  assertEquals(new Uint8Array(decompressed), data);
-});
-
-test("TIFF-like: large image with Deflate", async () => {
-  const width = 50;
-  const height = 50;
-  const data = new Uint8Array(width * height * 4);
-  for (let i = 0; i < data.length; i += 4) {
-    data[i] = 255;
-    data[i + 1] = 0;
-    data[i + 2] = 0;
-    data[i + 3] = 255;
-  }
-  const compressed = await deflateCompress(data);
-  const decompressed = await deflateDecompress(compressed);
+test("TIFF-like: large image Deflate roundtrip", async () => {
+  const data = new Uint8Array(10000);
+  for (let i = 0; i < data.length; i += 4) { data[i] = 255; data[i + 3] = 255; }
+  const compressed = await deflateData(data);
+  const decompressed = await inflateData(compressed);
   assertEquals(decompressed, data);
 });
