@@ -41,10 +41,18 @@ export class PNGFormat extends PNGBase {
    * Decode a PNG-like blob back to RGBA.
    * Mirrors the cross-org/image PNGFormat.decode() call chain:
    * this.inflate() (PNGBase.inflate → readStream → DecompressionStream)
+   *
+   * NOTE: Must use data.byteOffset when constructing DataView because `data`
+   * may be a subarray (e.g. ICOFormat passes data.subarray(22)), meaning
+   * data.buffer is the full parent buffer starting at byte 0, not at the
+   * subarray's logical byte 0. Without byteOffset the read would pull width/
+   * height from the wrong position and produce fast assertion failures rather
+   * than the actual Bun CompressionStream hang we are trying to reproduce.
    */
   async decode(data: Uint8Array): Promise<ImageData> {
-    const width = new DataView(data.buffer).getUint32(0, false);
-    const height = new DataView(data.buffer).getUint32(4, false);
+    const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const width = dv.getUint32(0, false);
+    const height = dv.getUint32(4, false);
     const compressed = data.subarray(8);
     const filtered = await this.inflate(compressed);
     const rgba = this.unfilterData(filtered, width, height);

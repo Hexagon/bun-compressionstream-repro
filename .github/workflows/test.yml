@@ -13,6 +13,9 @@ permissions:
 jobs:
   bun_test:
     runs-on: ubuntu-latest
+    # Job-level ceiling: kills the job if Bun's process scheduler itself
+    # deadlocks (which would defeat the per-test --timeout flag).
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -27,4 +30,7 @@ jobs:
         run: bun x jsr add @cross/test @std/assert
 
       - name: Run tests
-        run: bun test
+        # --timeout 10000: per-test 10 s limit so that a Bun CompressionStream
+        # deadlock surfaces as "timed out" rather than hanging the CI job forever.
+        # Assertion failures (the fast-fail case) still report in < 5 ms.
+        run: bun test --timeout 10000
