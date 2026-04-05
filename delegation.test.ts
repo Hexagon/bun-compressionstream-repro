@@ -1,17 +1,11 @@
 /**
- * Replicates cross-org/image test/formats/ico.test.ts structure exactly.
+ * Replicates cross-org/image test/formats/ico.test.ts structure.
  *
- * KEY DIFFERENCE from previous attempts: this file IMPORTS FROM TypeScript
- * source files (src/formats/ico.ts → src/formats/png.ts → src/formats/png_base.ts),
- * just as the cross-org/image ico.test.ts does. When 20+ Bun test workers all
- * simultaneously import and execute code from these shared TypeScript modules,
- * the CompressionStream + ReadableStream operations hang.
- *
- * The failing tests in cross-org/image PR #100 CI (commit cc9261e7) showed:
+ * Import chain: ICOFormat ← ico.ts ← png.ts ← png_base.ts
+ * This mirrors the exact chain that timed out in cross-org/image CI:
  *   ICO: encode and decode - small image [5000.98ms] — timeout
  *   ICO: encode - single pixel [5000.99ms] — timeout
- * while PNG tests using the same pattern passed (they ran in a different worker
- * without competing module-load synchronization).
+ *   (job 70009490278, merge commit cc9261e7)
  */
 
 import { test } from "@cross/test";

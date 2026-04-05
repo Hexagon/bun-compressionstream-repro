@@ -1,15 +1,11 @@
 /**
- * Replicates cross-org/image test/formats/tiff.test.ts (Deflate compression tests).
+ * Replicates cross-org/image test/formats/tiff.test.ts (Deflate compression).
  *
- * KEY DIFFERENCE from previous attempts: imports from src/utils/tiff_deflate.ts,
- * which in turn imports from src/formats/png_base.ts. Multiple Bun test workers
- * simultaneously importing and executing code from these shared TypeScript modules
- * triggers the CompressionStream hang in Bun v1.3.11.
- *
- * Failing tests from cross-org/image CI (cc9261e7):
+ * Import chain: deflateCompress ← tiff_deflate.ts
+ * Uses the same "double Response" pattern that timed out in cross-org/image CI:
  *   TIFF: encode and decode with Deflate compression [5000.98ms] — timeout
  *   TIFF: Deflate compression roundtrip [5000.98ms] — timeout
- *   TIFF: encode CMYK with compression [5000.99ms] — timeout
+ *   (job 70009490278, merge commit cc9261e7)
  */
 
 import { test } from "@cross/test";

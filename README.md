@@ -1,78 +1,99 @@
 # Bun CompressionStream hang reproduction
 
-Reproduces the `CompressionStream` / `DecompressionStream` hang seen in
-[cross-org/image PR #100](https://github.com/cross-org/image/pull/100) CI
-(Bun v1.3.11, job [70009490278](https://github.com/cross-org/image/actions/runs/...)).
+Minimal reproduction of `CompressionStream` / `DecompressionStream` hanging in `bun test` on GitHub
+Actions CI, as observed in [cross-org/image PR #100](https://github.com/cross-org/image/pull/100).
 
-## Root cause
+## Observed failure
 
-The hang requires **two conditions** to occur simultaneously:
+In [cross-org/image CI job 70009490278](https://github.com/cross-org/image/actions/runs/23989940910)
+(merge commit `cc9261e7`), **15 tests timed out** at 5000 ms — every test that calls
+`CompressionStream("deflate")` or `DecompressionStream("deflate")` through the shared
+`png_base.ts` module. Tests that don't use compression (JPEG, WebP, BMP, etc.) all passed.
 
-1. **The `readStream` + `CompressionStream` pattern**: reading a piped
-   `CompressionStream` output via a manual `reader.read()` loop from a
-   `ReadableStream` created inline.
+Failing tests:
+- `ICO: encode and decode` (5 tests × 5 000 ms)
+- `TIFF: Deflate compression` (3 tests × 5 000 ms)
+- `APNG: encode` (4 tests × 5 000 ms)
+- `Image: composite and save / processing pipeline / filter` (3 tests × 5 000 ms)
 
-2. **Concurrent shared-module imports**: multiple Bun test workers (processes)
-   ALL importing from the SAME TypeScript source files
-   (`png_base.ts` → `tiff_deflate.ts`) at startup. This synchronizes workers
-   so they all call `readStream()` → `new CompressionStream("deflate")` at
-   roughly the same instant. Under this concurrent load, Bun v1.3.11's
-   `TransformStream`/`ReadableStream` implementation deadlocks.
+## Patterns tested
 
-**Why the previous repro attempts all passed**: they had inline code in each
-test file — no shared TypeScript source imports. Without the module-loading
-synchronization point, workers started at different times and never competed
-for the CompressionStream simultaneously.
+### Pattern A — "double Response" (original base code @ `b16127ef`)
 
-## Evidence from cross-org/image CI
-
-The failing CI (merge commit `cc9261e7`, job `70009490278`) already had
-the `readStream` fix applied. PNG tests **passed** because the png.test.ts
-worker ran with lighter module loading. ICO/TIFF/APNG tests **failed** because:
-
-- `ico.test.ts` → imports `ico.ts` → `png.ts` → `png_base.ts`
-- `tiff.test.ts` → imports `tiff_deflate.ts` → `png_base.ts`
-- Multiple other workers also import `png_base.ts`
-
-When 20+ workers all load `png_base.ts` in parallel and immediately call
-`deflate()` / `inflate()`, the `CompressionStream` hangs.
-
-## Repository structure
-
-```
-src/
-  formats/
-    png_base.ts         ← exact copy of cross-org/image PNGBase (cc9261e7)
-    png.ts              ← PNGFormat extends PNGBase
-    ico.ts              ← ICOFormat delegates to PNGFormat
-  utils/
-    tiff_deflate.ts     ← exact copy of cross-org/image tiff_deflate.ts (cc9261e7)
-
-delegation.test.ts      ← imports ICOFormat from src/formats/ico.ts
-tiff_deflate.test.ts    ← imports deflateCompress from src/utils/tiff_deflate.ts
-deflate_worker_01-20.test.ts  ← 20 files, each importing tiff_deflate.ts
-compression.test.ts     ← bun:test baseline (inline, always passes)
+```typescript
+const stream = new Response(data as unknown as BodyInit).body!
+  .pipeThrough(new CompressionStream("deflate"));
+const compressed = await new Response(stream).arrayBuffer();
 ```
 
-## Reproduce locally
+This is the pattern that was on `main` when the hang was first observed. The commit message of
+the fix attempt (`4ca2578d`) states: *"The Response body wrapping hangs in certain Bun versions."*
+
+### Pattern B — "readStream" (fix attempt @ `cc9261e7`)
+
+```typescript
+async function readStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  // ... concatenate chunks
+}
+
+return readStream(
+  new ReadableStream({ start(c) { c.enqueue(data); c.close(); } })
+    .pipeThrough(new CompressionStream("deflate")),
+);
+```
+
+This pattern was introduced by PR #100 to work around Pattern A. **CI still timed out** at
+`cc9261e7`, confirming both patterns hang under the same conditions.
+
+### Workaround — `node:zlib` (final fix @ `0201dc61`)
+
+The fix that actually resolved the hang replaces `CompressionStream` entirely with synchronous
+`node:zlib` (`deflateSync` / `inflateSync`), falling back to `CompressionStream` only in
+browser environments.
+
+## Structure
+
+| File | Description |
+|------|-------------|
+| `compression.test.ts` | Baseline tests (Pattern A + B, inline, no shared imports) |
+| `delegation.test.ts` | ICO → PNG → PNGBase delegation chain (mirrors `ico.test.ts`) |
+| `tiff_deflate.test.ts` | TIFF Deflate roundtrip (mirrors `tiff.test.ts`) |
+| `src/formats/png_base.ts` | PNGBase with deflate/inflate using Pattern A |
+| `src/formats/png.ts` | PNGFormat extends PNGBase |
+| `src/formats/ico.ts` | ICOFormat delegates to PNGFormat |
+| `src/utils/tiff_deflate.ts` | deflateCompress/deflateDecompress using Pattern A |
+
+## Reproduce
 
 ```bash
-bun x jsr add @cross/test @std/assert
 bun test
 ```
 
-Tests importing from `src/` should time out after 5 000 ms.
+If the bug is present in your Bun version, tests in `delegation.test.ts` and
+`tiff_deflate.test.ts` will time out (5 000 ms default for `@cross/test`).
 
-## Reproduce in CI
+## CI configuration
 
-Push to GitHub. The workflow at `.github/workflows/test.yml` runs `bun test` on push/PR.
+The workflow matches `cross-org/workflows/.github/workflows/bun-ci.yml` exactly:
+- `antongolub/action-setup-bun@v1.13.2` with `bun-version: v1.x`
+- Same JSR dependencies: `@cross/test @cross/fs @cross/dir @std/assert @std/path`
+- Plain `bun test` (no `--timeout` flag)
 
-## Expected behaviour (if fixed)
+## Status
 
-All tests pass quickly (< 100 ms each).
+⚠️ **Bug not yet reliably reproduced in this minimal repo.** The cross-org/image CI failure
+involves 55 test files (626 tests) with heavy image processing workloads. The hang may require
+conditions that are difficult to reproduce in isolation:
 
-## Actual behaviour
+- Many concurrent test workers loading large TypeScript module graphs
+- Specific timing of `CompressionStream` calls across worker processes
+- Potential interaction with Bun's internal thread pool under heavy load
 
-Tests in files that import from `src/formats/png_base.ts` or
-`src/utils/tiff_deflate.ts` hang at `reader.read()` inside `readStream()`,
-timing out after 5 000 ms.
+Bun version in both environments: **v1.3.11** (`antongolub/action-setup-bun` with `v1.x`).

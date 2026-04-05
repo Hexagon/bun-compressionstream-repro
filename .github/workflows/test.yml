@@ -13,12 +13,11 @@ permissions:
 jobs:
   bun_test:
     runs-on: ubuntu-latest
-    # Job-level ceiling: kills the job if Bun's process scheduler itself
-    # deadlocks (which would defeat the per-test --timeout flag).
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
+      # Same setup as cross-org/workflows bun-ci.yml
       - uses: antongolub/action-setup-bun@v1.13.2
         with:
           bun-version: v1.x
@@ -26,11 +25,10 @@ jobs:
       - name: Print Bun version
         run: bun --version
 
+      # Same JSR dependencies as cross-org/image CI
       - name: Install JSR dependencies
-        run: bun x jsr add @cross/test @std/assert
+        run: bun x jsr add @cross/test @cross/fs @cross/dir @std/assert @std/path
 
+      # Plain `bun test` — no --timeout flag, matching cross-org/image CI exactly
       - name: Run tests
-        # --timeout 10000: per-test 10 s limit so that a Bun CompressionStream
-        # deadlock surfaces as "timed out" rather than hanging the CI job forever.
-        # Assertion failures (the fast-fail case) still report in < 5 ms.
-        run: bun test --timeout 10000
+        run: bun test

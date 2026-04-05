@@ -1,8 +1,30 @@
+/**
+ * Baseline CompressionStream / DecompressionStream tests.
+ *
+ * This file tests the compression patterns IN ISOLATION — no shared module
+ * imports from src/. In cross-org/image CI (job 70009490278), the inline
+ * CompressionStream tests pass, but tests that import from shared TypeScript
+ * source files (ico.ts → png.ts → png_base.ts) all time out at 5000 ms.
+ *
+ * Pattern A — "double Response" (cross-org/image main @ b16127ef):
+ *   new Response(data).body!.pipeThrough(new CompressionStream("deflate"))
+ *   → await new Response(stream).arrayBuffer()
+ *
+ * Pattern B — "readStream" (cross-org/image fix @ cc9261e7):
+ *   readStream(new ReadableStream({start(c){c.enqueue(data);c.close()}})
+ *       .pipeThrough(new CompressionStream("deflate")))
+ *
+ * Both patterns hung in cross-org/image CI. The fix that actually worked
+ * was replacing CompressionStream entirely with synchronous node:zlib
+ * (src/utils/deflate.ts @ 0201dc61).
+ */
 import { describe, expect, test } from "bun:test";
 import { deflateSync, inflateSync } from "node:zlib";
 
-/** Collect all chunks from a ReadableStream into a single Uint8Array. */
-async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+/** Collect all chunks from a ReadableStream (Pattern B helper). */
+async function readStream(
+  stream: ReadableStream<Uint8Array>,
+): Promise<Uint8Array> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   while (true) {
@@ -20,7 +42,6 @@ async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> 
   return out;
 }
 
-/** Build a deterministic test payload (64 KiB). */
 function makePayload(size = 65_536): Uint8Array {
   const buf = new Uint8Array(size);
   for (let i = 0; i < size; i++) buf[i] = i & 0xff;
@@ -30,16 +51,33 @@ function makePayload(size = 65_536): Uint8Array {
 describe("CompressionStream / DecompressionStream", () => {
   const original = makePayload();
 
-  // ── Baseline: node:zlib (synchronous) ─────────────────────────────
-  test("deflateSync / inflateSync roundtrip (baseline)", () => {
+  test("baseline: deflateSync / inflateSync roundtrip", () => {
     const compressed = deflateSync(original);
     const decompressed = inflateSync(compressed);
     expect(new Uint8Array(decompressed)).toEqual(original);
   });
 
-  // ── Web Streams: CompressionStream ────────────────────────────────
-  test("CompressionStream roundtrip", async () => {
-    const compressed = await readAll(
+  // ── Pattern A: double Response (original cross-org/image base code) ──
+  test("Pattern A: deflate via double Response wrapping", async () => {
+    const stream = new Response(original as unknown as BodyInit).body!
+      .pipeThrough(new CompressionStream("deflate"));
+    const compressed = await new Response(stream).arrayBuffer();
+    const result = new Uint8Array(inflateSync(new Uint8Array(compressed)));
+    expect(result).toEqual(original);
+  });
+
+  test("Pattern A: inflate via double Response wrapping", async () => {
+    const zlibCompressed = deflateSync(original);
+    const stream = new Response(
+      new Uint8Array(zlibCompressed) as unknown as BodyInit,
+    ).body!.pipeThrough(new DecompressionStream("deflate"));
+    const decompressed = await new Response(stream).arrayBuffer();
+    expect(new Uint8Array(decompressed)).toEqual(original);
+  });
+
+  // ── Pattern B: readStream (cross-org/image PR #100 fix attempt) ──
+  test("Pattern B: deflate via readStream + ReadableStream", async () => {
+    const compressed = await readStream(
       new ReadableStream({
         start(controller) {
           controller.enqueue(original);
@@ -47,19 +85,16 @@ describe("CompressionStream / DecompressionStream", () => {
         },
       }).pipeThrough(new CompressionStream("deflate")),
     );
-    // Verify by decompressing with node:zlib
     const result = new Uint8Array(inflateSync(compressed));
     expect(result).toEqual(original);
   });
 
-  // ── Web Streams: DecompressionStream ──────────────────────────────
-  test("DecompressionStream roundtrip", async () => {
-    // Compress with node:zlib, decompress with DecompressionStream
-    const compressed = deflateSync(original);
-    const decompressed = await readAll(
+  test("Pattern B: inflate via readStream + ReadableStream", async () => {
+    const zlibCompressed = deflateSync(original);
+    const decompressed = await readStream(
       new ReadableStream({
         start(controller) {
-          controller.enqueue(new Uint8Array(compressed));
+          controller.enqueue(new Uint8Array(zlibCompressed));
           controller.close();
         },
       }).pipeThrough(new DecompressionStream("deflate")),
@@ -67,9 +102,9 @@ describe("CompressionStream / DecompressionStream", () => {
     expect(decompressed).toEqual(original);
   });
 
-  // ── Web Streams: full pipe chain ──────────────────────────────────
-  test("pipeThrough deflate + inflate roundtrip", async () => {
-    const result = await readAll(
+  // ── Full roundtrip pipe chain ──
+  test("Pattern B: deflate + inflate pipe chain", async () => {
+    const result = await readStream(
       new ReadableStream({
         start(controller) {
           controller.enqueue(original);
@@ -79,25 +114,6 @@ describe("CompressionStream / DecompressionStream", () => {
         .pipeThrough(new CompressionStream("deflate"))
         .pipeThrough(new DecompressionStream("deflate")),
     );
-    expect(result).toEqual(original);
-  });
-
-  // ── Alternative: new Response().body feed ─────────────────────────
-  test("new Response().body.pipeThrough (alternative feed)", async () => {
-    const body = new Response(original).body!;
-    const compressed = await readAll(
-      body.pipeThrough(new CompressionStream("deflate")),
-    );
-    const result = new Uint8Array(inflateSync(compressed));
-    expect(result).toEqual(original);
-  });
-
-  // ── Broken: double Response wrapping (original png_base.ts pattern) ──
-  test("new Response(data).body → CompressionStream → new Response(stream).arrayBuffer() [hangs in Bun]", async () => {
-    const stream = new Response(original as unknown as BodyInit).body!
-      .pipeThrough(new CompressionStream("deflate"));
-    const compressed = await new Response(stream).arrayBuffer();
-    const result = new Uint8Array(inflateSync(new Uint8Array(compressed)));
     expect(result).toEqual(original);
   });
 });
