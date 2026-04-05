@@ -2,10 +2,12 @@
  * Mimics the cross-org/image ICO → PNG → CompressionStream delegation pattern
  * that caused tests to hang indefinitely in Bun CI.
  *
- * In cross-org/image, ICOFormat.encode() calls this.pngFormat.encode() which calls
- * this.deflate() which uses CompressionStream. The extra level of async delegation
- * through a class instance is the key structural difference from calling
- * CompressionStream directly.
+ * Uses the ORIGINAL BROKEN pattern from png_base.ts before PR #100's fix:
+ * https://github.com/cross-org/image/pull/100/files
+ *
+ * The broken code fed a Uint8Array through new Response(data).body and consumed
+ * the output via new Response(stream).arrayBuffer() — the double-Response wrapping
+ * that hangs in Bun when run under @cross/test.
  *
  * Uses @cross/test (instead of bun:test) to replicate the exact test framework
  * used in cross-org/image.
@@ -15,44 +17,27 @@ import { test } from "@cross/test";
 import { assertEquals } from "@std/assert";
 import { inflateSync } from "node:zlib";
 
-/** Collect all chunks from a ReadableStream into a single Uint8Array. */
-async function readStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = [];
-  const reader = stream.getReader();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const total = chunks.reduce((n, c) => n + c.byteLength, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const c of chunks) {
-    out.set(c, offset);
-    offset += c.byteLength;
-  }
-  return out;
-}
-
 /**
  * Mimics PNGBase (the base class for PNG/APNG in cross-org/image).
- * deflate() is the exact pattern used in png_base.ts after commit 4ca2578:
- * https://github.com/cross-org/image/blob/4ca2578d26e88783e12667abb68c15811ba0f88f/src/formats/png_base.ts
+ * Uses the ORIGINAL BROKEN deflate/inflate pattern from png_base.ts before the fix:
+ * https://github.com/cross-org/image/blob/0201dc61f7f5646c22c8f3f6e9bd32f3e1bf78b3/src/formats/png_base.ts
+ *
+ * The hang: feeding a Uint8Array as BodyInit through new Response().body,
+ * then consuming the piped output via new Response(stream).arrayBuffer().
  */
 class PNGLikeEncoder {
   async deflate(data: Uint8Array): Promise<Uint8Array> {
-    return readStream(
-      new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(data);
-          controller.close();
-        },
-      }).pipeThrough(new CompressionStream("deflate")),
-    );
+    const stream = new Response(data as unknown as BodyInit).body!
+      .pipeThrough(new CompressionStream("deflate"));
+    const compressed = await new Response(stream).arrayBuffer();
+    return new Uint8Array(compressed);
+  }
+
+  async inflate(data: Uint8Array): Promise<Uint8Array> {
+    const stream = new Response(data as unknown as BodyInit).body!
+      .pipeThrough(new DecompressionStream("deflate"));
+    const decompressed = await new Response(stream).arrayBuffer();
+    return new Uint8Array(decompressed);
   }
 
   async encode(imageData: { width: number; height: number; data: Uint8Array }): Promise<Uint8Array> {
@@ -71,7 +56,8 @@ class PNGLikeEncoder {
 
 /**
  * Mimics ICOFormat (which holds a PNGFormat instance and delegates encode/decode).
- * This is the exact structural pattern that triggered the hang in cross-org/image.
+ * This replicates the structural delegation pattern from cross-org/image:
+ * https://github.com/cross-org/image/blob/0201dc61f7f5646c22c8f3f6e9bd32f3e1bf78b3/src/formats/ico.ts
  */
 class ICOLikeEncoder {
   private pngEncoder = new PNGLikeEncoder();
@@ -91,7 +77,7 @@ class ICOLikeEncoder {
 /**
  * Mimics APNGFormat (which extends PNGBase and calls this.deflate() directly).
  * Replicates the pattern from src/formats/apng.ts in cross-org/image:
- * https://github.com/cross-org/image/blob/4ca2578d26e88783e12667abb68c15811ba0f88f/src/formats/apng.ts
+ * https://github.com/cross-org/image/blob/0201dc61f7f5646c22c8f3f6e9bd32f3e1bf78b3/src/formats/apng.ts
  */
 class APNGLikeEncoder {
   private base = new PNGLikeEncoder();

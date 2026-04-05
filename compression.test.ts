@@ -91,4 +91,13 @@ describe("CompressionStream / DecompressionStream", () => {
     const result = new Uint8Array(inflateSync(compressed));
     expect(result).toEqual(original);
   });
+
+  // ── Broken: double Response wrapping (original png_base.ts pattern) ──
+  test("new Response(data).body → CompressionStream → new Response(stream).arrayBuffer() [hangs in Bun]", async () => {
+    const stream = new Response(original as unknown as BodyInit).body!
+      .pipeThrough(new CompressionStream("deflate"));
+    const compressed = await new Response(stream).arrayBuffer();
+    const result = new Uint8Array(inflateSync(new Uint8Array(compressed)));
+    expect(result).toEqual(original);
+  });
 });

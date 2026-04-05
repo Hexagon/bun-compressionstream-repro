@@ -1,66 +1,42 @@
 /**
  * Mimics the cross-org/image TIFF Deflate compression tests that hung in Bun CI.
  *
- * In cross-org/image, tiff_deflate.ts uses the same ReadableStream → CompressionStream
- * pattern but the tests timed out. This file uses @cross/test to replicate the
- * exact framework used in cross-org/image.
+ * Uses the ORIGINAL BROKEN pattern from png_base.ts before PR #100's fix:
+ * https://github.com/cross-org/image/pull/100/files
+ *
+ * The broken code: new Response(data).body → CompressionStream → new Response(stream).arrayBuffer()
+ * This double-Response wrapping hangs in Bun when run under @cross/test.
+ *
+ * This file uses @cross/test to replicate the exact framework used in cross-org/image.
  */
 
 import { test } from "@cross/test";
 import { assertEquals } from "@std/assert";
 import { inflateSync, deflateSync } from "node:zlib";
 
-/** Collect all chunks from a ReadableStream into a single Uint8Array. */
-async function readStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = [];
-  const reader = stream.getReader();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const total = chunks.reduce((n, c) => n + c.byteLength, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const c of chunks) {
-    out.set(c, offset);
-    offset += c.byteLength;
-  }
-  return out;
+/**
+ * Original broken deflateCompress pattern from png_base.ts before the fix:
+ * https://github.com/cross-org/image/blob/0201dc61f7f5646c22c8f3f6e9bd32f3e1bf78b3/src/formats/png_base.ts
+ *
+ * Feeds a Uint8Array as BodyInit through new Response().body,
+ * then consumes the piped output via new Response(stream).arrayBuffer().
+ */
+async function deflateCompress(data: Uint8Array): Promise<Uint8Array> {
+  const stream = new Response(data as unknown as BodyInit).body!
+    .pipeThrough(new CompressionStream("deflate"));
+  const compressed = await new Response(stream).arrayBuffer();
+  return new Uint8Array(compressed);
 }
 
 /**
- * Exact replica of tiff_deflate.ts deflateCompress() after commit 4ca2578 in cross-org/image:
- * https://github.com/cross-org/image/blob/4ca2578d26e88783e12667abb68c15811ba0f88f/src/utils/tiff_deflate.ts
+ * Original broken deflateDecompress pattern from png_base.ts before the fix:
+ * https://github.com/cross-org/image/blob/0201dc61f7f5646c22c8f3f6e9bd32f3e1bf78b3/src/formats/png_base.ts
  */
-function deflateCompress(data: Uint8Array): Promise<Uint8Array> {
-  return readStream(
-    new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(data);
-        controller.close();
-      },
-    }).pipeThrough(new CompressionStream("deflate")),
-  );
-}
-
-/**
- * Exact replica of tiff_deflate.ts deflateDecompress() after commit 4ca2578:
- * https://github.com/cross-org/image/blob/4ca2578d26e88783e12667abb68c15811ba0f88f/src/utils/tiff_deflate.ts
- */
-function deflateDecompress(data: Uint8Array): Promise<Uint8Array> {
-  return readStream(
-    new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(data);
-        controller.close();
-      },
-    }).pipeThrough(new DecompressionStream("deflate")),
-  );
+async function deflateDecompress(data: Uint8Array): Promise<Uint8Array> {
+  const stream = new Response(data as unknown as BodyInit).body!
+    .pipeThrough(new DecompressionStream("deflate"));
+  const decompressed = await new Response(stream).arrayBuffer();
+  return new Uint8Array(decompressed);
 }
 
 // ── Reproduce cross-org/image: TIFF Deflate compression tests ──

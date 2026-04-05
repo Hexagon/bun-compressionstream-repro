@@ -5,39 +5,59 @@ Actions CI. Mirrors the patterns from [cross-org/image PR #100](https://github.c
 
 ## Issue
 
-When using `CompressionStream("deflate")` or `DecompressionStream("deflate")` via `.pipeThrough()`
-inside a `bun test` run, the reader blocks indefinitely and the test times out. This occurs
-regardless of how data is fed into the stream (via `new Response(data).body`, or a manual
-`ReadableStream` with `controller.enqueue`).
+When consuming a `CompressionStream` output via `new Response(stream).arrayBuffer()` in Bun, the
+Promise never resolves and the test times out. This is the **double `Response` wrapping** pattern:
+
+```typescript
+// BROKEN — hangs in Bun
+const stream = new Response(data as unknown as BodyInit).body!
+  .pipeThrough(new CompressionStream("deflate"));
+const compressed = await new Response(stream).arrayBuffer(); // ← never resolves
+```
+
+The workaround (used by PR #100's fix) is to read the stream directly:
+
+```typescript
+// FIXED — works in Bun
+async function readStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  // ... concat chunks ...
+}
+const compressed = await readStream(
+  new ReadableStream({ start(c) { c.enqueue(data); c.close(); } })
+    .pipeThrough(new CompressionStream("deflate"))
+);
+```
 
 The hang reproduces reliably in GitHub Actions CI with `antongolub/action-setup-bun@v1.13.2` using
-`bun-version: v1.x`.
+`bun-version: v1.x` (Bun v1.3.11).
 
 ## Context — cross-org/image investigation
 
 In [cross-org/image PR #100](https://github.com/cross-org/image/pull/100), `bun test` ran 626 tests
-across 55 files with `@cross/test` as the test framework. Tests that used `CompressionStream`
-through a **class delegation chain** (e.g. `ICOFormat.encode()` → `PNGFormat.encode()` →
-`CompressionStream`) timed out with the 5 000 ms default, while tests that called
-`PNGFormat.encode()` directly passed.
+across 55 files. Tests using `CompressionStream` / `DecompressionStream` with the double-`Response`
+pattern all timed out:
 
-Key observations:
+- `test/formats/ico.test.ts` — `ICOFormat.encode()` → `PNGFormat.encode()` → double-`Response` deflate → **hung at 5000ms**
+- `test/formats/tiff.test.ts` — Deflate compression → **hung at 5000ms**
+- `test/formats/apng.test.ts` — frame encoding → **hung at 5000ms**
 
-- Both repos use Bun v1.3.11 (confirmed from CI logs).
-- `png.test.ts` tests calling `PNGFormat.encode()` directly **passed**.
-- `ico.test.ts` tests calling `ICOFormat.encode()` (which delegates to `PNGFormat.encode()`)
-  **hung** with 5 000 ms timeouts.
-- `tiff.test.ts` Deflate compression tests (same `ReadableStream → CompressionStream` pattern)
-  **hung** as well.
-- `@cross/test` (a cross-runtime test wrapper backed by `bun:test`) was used in all test files.
+The **fix** in PR #100 replaced the double-`Response` wrapping with a direct `ReadableStream`
+reader loop, which works correctly.
 
 ## Test files in this repo
 
-- **`compression.test.ts`** — baseline tests using `bun:test` directly; these pass.
-- **`delegation.test.ts`** — replicates the `ICO → PNG → CompressionStream` delegation pattern
-  using `@cross/test`; these are the tests expected to hang.
-- **`tiff_deflate.test.ts`** — replicates the TIFF Deflate compression pattern from
-  `tiff_deflate.ts` using `@cross/test`; also expected to hang.
+- **`compression.test.ts`** — `bun:test` directly; includes both working and broken patterns
+- **`delegation.test.ts`** — replicates the `ICO → PNG → CompressionStream` class delegation
+  using `@cross/test` and the **broken** double-`Response` pattern
+- **`tiff_deflate.test.ts`** — replicates the TIFF Deflate pattern using `@cross/test` and the
+  **broken** double-`Response` pattern
 
 ## Reproduce locally
 
@@ -46,8 +66,7 @@ bun x jsr add @cross/test @std/assert
 bun test
 ```
 
-If the issue is present in your Bun version, the `CompressionStream` and `DecompressionStream` tests
-in `delegation.test.ts` and `tiff_deflate.test.ts` will time out (5 s default).
+Tests using `new Response(stream).arrayBuffer()` will time out after 5 000 ms.
 
 ## Reproduce in CI
 
@@ -56,8 +75,9 @@ automatically on push / PR.
 
 ## Expected behaviour (if fixed)
 
-All tests should pass in under 100 ms each.
+All tests pass quickly.
 
-## Actual behaviour (affected versions)
+## Actual behaviour (affected Bun versions)
 
-Tests in `delegation.test.ts` and `tiff_deflate.test.ts` hang until the 5 000 ms timeout and fail.
+Tests using `await new Response(piped_stream).arrayBuffer()` hang indefinitely and are killed by
+the 5 000 ms default timeout.
