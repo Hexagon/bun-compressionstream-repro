@@ -1,7 +1,7 @@
 /**
  * Replicates cross-org/image test/formats/ico.test.ts structure.
  *
- * Import chain: ICOFormat ← ico.ts ← png.ts ← png_base.ts
+ * Import chain: ICOFormat ← ico.ts ← png.ts ← png_base.ts ← types/index.ts, crc32.ts
  * This mirrors the exact chain that timed out in cross-org/image CI:
  *   ICO: encode and decode - small image [5000.98ms] — timeout
  *   ICO: encode - single pixel [5000.99ms] — timeout
@@ -11,6 +11,11 @@
 import { test } from "@cross/test";
 import { assertEquals } from "@std/assert";
 import { ICOFormat } from "./src/formats/ico.ts";
+import { PNGFormat } from "./src/formats/png.ts";
+import type { ImageData } from "./src/types/index.ts";
+import { crc32 } from "./src/utils/crc32.ts";
+import { brightness, grayscale, invert } from "./src/processing/filters.ts";
+import { resizeNearest } from "./src/processing/resize.ts";
 
 test("ICO: canDecode - valid ICO signature", () => {
   const validICO = new Uint8Array([0x00, 0x00, 0x01, 0x00, 0x01, 0x00]);

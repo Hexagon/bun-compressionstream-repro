@@ -1,16 +1,16 @@
 /**
  * Replicates cross-org/image test/formats/tiff.test.ts (Deflate compression).
  *
- * Import chain: deflateCompress ← tiff_deflate.ts
- * Uses the same "double Response" pattern that timed out in cross-org/image CI:
- *   TIFF: encode and decode with Deflate compression [5000.98ms] — timeout
- *   TIFF: Deflate compression roundtrip [5000.98ms] — timeout
- *   (job 70009490278, merge commit cc9261e7)
+ * Import chain: deflateCompress ← tiff_deflate.ts ← types/index.ts
+ * Uses the same readStream + CompressionStream pattern from cc9261e7.
  */
 
 import { test } from "@cross/test";
 import { assertEquals } from "@std/assert";
 import { deflateCompress, deflateDecompress } from "./src/utils/tiff_deflate.ts";
+import { crc32 } from "./src/utils/crc32.ts";
+import { brightness, grayscale } from "./src/processing/filters.ts";
+import type { ImageData } from "./src/types/index.ts";
 
 test("TIFF: encode and decode with Deflate compression", async () => {
   const imageData = new Uint8Array([

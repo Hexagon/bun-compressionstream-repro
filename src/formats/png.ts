@@ -8,12 +8,10 @@
  */
 
 import { PNGBase } from "./png_base.ts";
+import type { ImageData } from "../types/index.ts";
+import { crc32 } from "../utils/crc32.ts";
 
-export interface ImageData {
-  width: number;
-  height: number;
-  data: Uint8Array;
-}
+export type { ImageData } from "../types/index.ts";
 
 export class PNGFormat extends PNGBase {
   readonly name = "png";

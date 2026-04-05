@@ -5,6 +5,8 @@
  * Source: https://github.com/cross-org/image/blob/cc9261e7/src/utils/tiff_deflate.ts
  */
 
+import type { CompressionOptions } from "../types/index.ts";
+
 /**
  * Collect all chunks from a ReadableStream<Uint8Array> into a single Uint8Array.
  * Using ReadableStream directly (instead of new Response(data).body) avoids a hang

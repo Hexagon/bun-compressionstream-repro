@@ -1,13 +1,16 @@
 /**
  * Minimal ICOFormat replicating cross-org/image's ICOFormat class structure.
- * https://github.com/cross-org/image/blob/cc9261e7c1412265872a6020135002bc8cd5c92d/src/formats/ico.ts
+ * https://github.com/cross-org/image/blob/cc9261e7/src/formats/ico.ts
  *
  * ICOFormat holds a private PNGFormat instance (pngFormat) and delegates
- * encode/decode to it — exactly as cross-org/image does. This extra
- * level of async delegation is the key structural feature reproduced here.
+ * encode/decode to it — exactly as cross-org/image does.
  */
 
-import { PNGFormat, type ImageData } from "./png.ts";
+import { PNGFormat } from "./png.ts";
+import type { ImageData } from "../types/index.ts";
+import { validateDimensions } from "../types/index.ts";
+
+export type { ImageData };
 
 export class ICOFormat {
   readonly name = "ico";

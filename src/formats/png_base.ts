@@ -6,6 +6,12 @@
  * CI:    job 70009490278, run 23989940910 (15 tests timed out @ 5000 ms)
  */
 
+import type { ImageMetadata } from "../types/index.ts";
+import { crc32 } from "../utils/crc32.ts";
+
+// Constants matching cross-org/image
+const INCHES_PER_METER = 39.3701;
+
 /**
  * Collect all chunks from a ReadableStream<Uint8Array> into a single Uint8Array.
  * Using ReadableStream directly (instead of new Response(data).body) avoids a hang
