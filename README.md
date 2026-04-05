@@ -55,9 +55,13 @@ reader loop, which works correctly.
 
 - **`compression.test.ts`** — `bun:test` directly; includes both working and broken patterns
 - **`delegation.test.ts`** — replicates the `ICO → PNG → CompressionStream` class delegation
-  using `@cross/test` and the **broken** double-`Response` pattern
+  using `@cross/test` and the double-`Response` pattern from before PR #100
 - **`tiff_deflate.test.ts`** — replicates the TIFF Deflate pattern using `@cross/test` and the
-  **broken** double-`Response` pattern
+  double-`Response` pattern
+- **`deflate_worker_01.test.ts` – `deflate_worker_20.test.ts`** — 20 files each running 5
+  CompressionStream roundtrip tests with `@cross/test`, using the exact `readStream` helper
+  from cross-org/image after PR #100. These create the parallel-worker CompressionStream load
+  (~100 ops across 20 Bun worker processes) that triggers the intermittent deadlock.
 
 ## Reproduce locally
 
