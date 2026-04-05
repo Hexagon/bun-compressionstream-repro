@@ -23,5 +23,8 @@ jobs:
       - name: Print Bun version
         run: bun --version
 
+      - name: Install JSR dependencies
+        run: bun x jsr add @cross/test @std/assert
+
       - name: Run tests
         run: bun test

@@ -1,0 +1,185 @@
+/**
+ * Mimics the cross-org/image ICO → PNG → CompressionStream delegation pattern
+ * that caused tests to hang indefinitely in Bun CI.
+ *
+ * In cross-org/image, ICOFormat.encode() calls this.pngFormat.encode() which calls
+ * this.deflate() which uses CompressionStream. The extra level of async delegation
+ * through a class instance is the key structural difference from calling
+ * CompressionStream directly.
+ *
+ * Uses @cross/test (instead of bun:test) to replicate the exact test framework
+ * used in cross-org/image.
+ */
+
+import { test } from "@cross/test";
+import { assertEquals } from "@std/assert";
+import { inflateSync } from "node:zlib";
+
+/** Collect all chunks from a ReadableStream into a single Uint8Array. */
+async function readStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const total = chunks.reduce((n, c) => n + c.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out;
+}
+
+/**
+ * Mimics PNGBase (the base class for PNG/APNG in cross-org/image).
+ * deflate() is the exact pattern used in png_base.ts after commit 4ca2578.
+ */
+class PNGLikeEncoder {
+  async deflate(data: Uint8Array): Promise<Uint8Array> {
+    return readStream(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(data);
+          controller.close();
+        },
+      }).pipeThrough(new CompressionStream("deflate")),
+    );
+  }
+
+  async encode(imageData: { width: number; height: number; data: Uint8Array }): Promise<Uint8Array> {
+    // Mimics PNGFormat.encode(): filter then deflate the pixel data
+    const { width, height, data } = imageData;
+    // Simple filter: prepend a filter-type byte (0 = None) to each row
+    const bytesPerRow = width * 4;
+    const filtered = new Uint8Array(height * (1 + bytesPerRow));
+    for (let y = 0; y < height; y++) {
+      filtered[y * (1 + bytesPerRow)] = 0; // filter type: None
+      filtered.set(data.subarray(y * bytesPerRow, (y + 1) * bytesPerRow), y * (1 + bytesPerRow) + 1);
+    }
+    return this.deflate(filtered);
+  }
+}
+
+/**
+ * Mimics ICOFormat (which holds a PNGFormat instance and delegates encode/decode).
+ * This is the exact structural pattern that triggered the hang in cross-org/image.
+ */
+class ICOLikeEncoder {
+  private pngEncoder = new PNGLikeEncoder();
+
+  async encode(imageData: { width: number; height: number; data: Uint8Array }): Promise<Uint8Array> {
+    // Mimics ICOFormat.encode(): delegate to pngFormat.encode()
+    const pngData = await this.pngEncoder.encode(imageData);
+    // Wrap the PNG data in a trivial container (ICO header is irrelevant here)
+    const result = new Uint8Array(6 + pngData.length);
+    result[2] = 1; // type = icon
+    result[4] = 1; // count = 1
+    result.set(pngData, 6);
+    return result;
+  }
+}
+
+/**
+ * Mimics APNGFormat (which extends PNGBase and calls this.deflate() directly).
+ */
+class APNGLikeEncoder {
+  private base = new PNGLikeEncoder();
+
+  async encodeFrame(data: Uint8Array): Promise<Uint8Array> {
+    return this.base.deflate(data);
+  }
+}
+
+// ── Reproduce cross-org/image: ICO encode delegating to PNG → CompressionStream ──
+
+test("delegation: ICO-like encode (small 2x2 image)", async () => {
+  const encoder = new ICOLikeEncoder();
+  const imageData = {
+    width: 2,
+    height: 2,
+    data: new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255]),
+  };
+  const encoded = await encoder.encode(imageData);
+  // Extract the deflated data (skip 6-byte header) and verify it decompresses
+  const deflated = encoded.subarray(6);
+  const decompressed = inflateSync(deflated);
+  assertEquals(decompressed.length, imageData.height * (1 + imageData.width * 4));
+});
+
+test("delegation: ICO-like encode (single pixel)", async () => {
+  const encoder = new ICOLikeEncoder();
+  const imageData = {
+    width: 1,
+    height: 1,
+    data: new Uint8Array([128, 128, 128, 255]),
+  };
+  const encoded = await encoder.encode(imageData);
+  const deflated = encoded.subarray(6);
+  const decompressed = inflateSync(deflated);
+  assertEquals(decompressed.length, 1 * (1 + 1 * 4));
+});
+
+test("delegation: ICO-like encode (larger 32x32 image)", async () => {
+  const encoder = new ICOLikeEncoder();
+  const width = 32;
+  const height = 32;
+  const data = new Uint8Array(width * height * 4);
+  for (let i = 0; i < data.length; i++) data[i] = i & 0xff;
+  const imageData = { width, height, data };
+  const encoded = await encoder.encode(imageData);
+  const deflated = encoded.subarray(6);
+  const decompressed = inflateSync(deflated);
+  assertEquals(decompressed.length, height * (1 + width * 4));
+});
+
+test("delegation: ICO-like encode with transparency", async () => {
+  const encoder = new ICOLikeEncoder();
+  const imageData = {
+    width: 2,
+    height: 2,
+    data: new Uint8Array([255, 0, 0, 128, 0, 255, 0, 64, 0, 0, 255, 0, 255, 255, 0, 255]),
+  };
+  const encoded = await encoder.encode(imageData);
+  const deflated = encoded.subarray(6);
+  const decompressed = inflateSync(deflated);
+  assertEquals(decompressed.length, imageData.height * (1 + imageData.width * 4));
+});
+
+test("delegation: APNG-like frame encode (small data)", async () => {
+  const encoder = new APNGLikeEncoder();
+  const frameData = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+  const compressed = await encoder.encodeFrame(frameData);
+  const decompressed = inflateSync(compressed);
+  assertEquals(new Uint8Array(decompressed), frameData);
+});
+
+test("delegation: APNG-like encode multiple frames", async () => {
+  const encoder = new APNGLikeEncoder();
+  for (let frame = 0; frame < 3; frame++) {
+    const frameData = new Uint8Array(16).fill(frame);
+    const compressed = await encoder.encodeFrame(frameData);
+    const decompressed = inflateSync(compressed);
+    assertEquals(new Uint8Array(decompressed), frameData);
+  }
+});
+
+test("delegation: composite and save (image processing pipeline)", async () => {
+  // Mimics Image.composite() then encode("png") → PNGFormat.encode()
+  const encoder = new PNGLikeEncoder();
+  const imageData = {
+    width: 4,
+    height: 4,
+    data: new Uint8Array(4 * 4 * 4).fill(128),
+  };
+  const compressed = await encoder.encode(imageData);
+  const decompressed = inflateSync(compressed);
+  assertEquals(decompressed.length, imageData.height * (1 + imageData.width * 4));
+});
